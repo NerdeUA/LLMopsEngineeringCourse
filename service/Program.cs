@@ -27,8 +27,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // routing (W2): поки одна модель, а треба обирати за задачею
     var model = defaultModel;  // TODO(student, W2)
 
-    // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
-    var systemPrompt = "You are a support assistant.";  // TODO(student, W1)
+    // Текст і версія читаються разом: лог описує саме використаний промпт.
+    var (systemPrompt, promptVersion) = await ReadActivePrompt(dbConn, app.Logger);
 
     // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
     // TODO(student, W3)
@@ -87,7 +87,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     decimal? costUsd = null;  // TODO(student, W2)
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -96,14 +96,73 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
 app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
-app.MapGet("/prompts", () => Results.Json(new { todo = "list from prompts table" }));              // W1/W2: [ { name, version, active } ]
+app.MapGet("/prompts", async () =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT name, version, active FROM prompts ORDER BY name, version", db);
+    await using var rows = await cmd.ExecuteReaderAsync();
+    var prompts = new List<object>();
+    while (await rows.ReadAsync())
+        prompts.Add(new { name = rows.GetString(0), version = rows.GetString(1), active = rows.GetBoolean(2) });
+    return Results.Json(prompts);
+});
+
+app.MapPost("/prompts/{version}/activate", async (string version) =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var tx = await db.BeginTransactionAsync();
+
+    // Серіалізуємо перемикання; звичайний SELECT у чаті не блокується.
+    await using var tableLock = new NpgsqlCommand(
+        "LOCK TABLE prompts IN SHARE ROW EXCLUSIVE MODE", db, tx);
+    await tableLock.ExecuteNonQueryAsync();
+
+    await using var exists = new NpgsqlCommand(
+        "SELECT EXISTS (SELECT 1 FROM prompts WHERE name = 'support' AND version = @version)", db, tx);
+    exists.Parameters.AddWithValue("version", version);
+    if (!(bool)(await exists.ExecuteScalarAsync())!)
+        return Results.NotFound(new { error = "Prompt version not found" });
+
+    await using var deactivate = new NpgsqlCommand(
+        "UPDATE prompts SET active = false WHERE name = 'support' AND active", db, tx);
+    await deactivate.ExecuteNonQueryAsync();
+    await using var activate = new NpgsqlCommand(
+        "UPDATE prompts SET active = true WHERE name = 'support' AND version = @version", db, tx);
+    activate.Parameters.AddWithValue("version", version);
+    await activate.ExecuteNonQueryAsync();
+    await tx.CommitAsync();
+    return Results.Ok(new { name = "support", version, active = true });
+});
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
 app.Run("http://0.0.0.0:8080");
 
+static async Task<(string Body, string Version)> ReadActivePrompt(string conn, ILogger logger)
+{
+    try
+    {
+        await using var db = new NpgsqlConnection(conn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT body, version FROM prompts WHERE name = 'support' AND active", db);
+        await using var rows = await cmd.ExecuteReaderAsync();
+        if (await rows.ReadAsync())
+            return (rows.GetString(0), rows.GetString(1));
+        logger.LogWarning("No active support prompt; using fallback prompt (version none)");
+    }
+    catch (NpgsqlException)
+    {
+        logger.LogWarning("Prompt registry unavailable; using fallback prompt (version none)");
+    }
+    return ("You are an assistant.", "none");
+}
+
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, int latency,
+static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
 {
     try
@@ -111,10 +170,11 @@ static async Task LogRequest(string conn, Guid id, string model, int latency,
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @version, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
+        cmd.Parameters.AddWithValue("version", promptVersion);
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);
         cmd.Parameters.AddWithValue("ct", completionTokens);
