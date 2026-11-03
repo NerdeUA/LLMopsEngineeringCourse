@@ -32,7 +32,17 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var model = ModelPolicy.SelectModel(body.Message, defaultModel);
 
     // Текст і версія читаються разом: лог описує саме використаний промпт.
-    var (systemPrompt, promptVersion) = await ReadActivePrompt(dbConn, app.Logger);
+    string systemPrompt, promptVersion;
+    try
+    {
+        (systemPrompt, promptVersion) = await ReadActivePrompt(dbConn, app.Logger);
+    }
+    catch (NpgsqlException)
+    {
+        // Інфраструктурний збій не є порожнім реєстром: БД не зможе зберегти і лог.
+        app.Logger.LogError("Prompt registry unavailable for request {RequestId}", requestId);
+        return Results.Problem(statusCode: 503, title: "Prompt registry unavailable");
+    }
 
     // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
     // TODO(student, W3)
@@ -158,21 +168,14 @@ app.Run("http://0.0.0.0:8080");
 
 static async Task<(string Body, string Version)> ReadActivePrompt(string conn, ILogger logger)
 {
-    try
-    {
-        await using var db = new NpgsqlConnection(conn);
-        await db.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            "SELECT body, version FROM prompts WHERE name = 'support' AND active", db);
-        await using var rows = await cmd.ExecuteReaderAsync();
-        if (await rows.ReadAsync())
-            return (rows.GetString(0), rows.GetString(1));
-        logger.LogWarning("No active support prompt; using fallback prompt (version none)");
-    }
-    catch (NpgsqlException)
-    {
-        logger.LogWarning("Prompt registry unavailable; using fallback prompt (version none)");
-    }
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT body, version FROM prompts WHERE name = 'support' AND active", db);
+    await using var rows = await cmd.ExecuteReaderAsync();
+    if (await rows.ReadAsync())
+        return (rows.GetString(0), rows.GetString(1));
+    logger.LogWarning("No active support prompt; using fallback prompt (version none)");
     return ("You are an assistant.", "none");
 }
 
