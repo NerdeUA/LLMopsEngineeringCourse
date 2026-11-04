@@ -24,6 +24,7 @@ if (dailyBudgetUsd < 0)
 var responseCache = new ConcurrentDictionary<(string Model, string Prompt, string Message), string>();
 long cacheHits = 0, cacheMisses = 0;
 long fallbackEvents = 0;
+long consecutiveProviderFailures = 0;
 var approvals = new ConcurrentDictionary<string, Approval>();
 
 // Additive migration for existing volumes; /chat still reports a registry outage normally.
@@ -106,8 +107,15 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         // Перемикаємо маршрут лише для тимчасових збоїв, а не помилок запиту.
         if (result.Status != 0 && result.Status != 429 && result.Status < 500) break;
     }
+    if (result.Ok)
+        Interlocked.Exchange(ref consecutiveProviderFailures, 0);
+    else
+        Interlocked.Increment(ref consecutiveProviderFailures);
     if (!result.Ok) model = selectedModel;
     var answer = result.Ok ? result.Answer : "Сервіс тимчасово недоступний. Спробуйте пізніше.";
+    var unusableAnswer = result.Ok && !result.HasToolCalls && answer.Trim() == "...";
+    if (unusableAnswer)
+        answer = "Не зміг сформулювати відповідь. Спробуйте переформулювати запит.";
     string? toolCall = null;
     string? approvalId = null;
     int promptTokens = result.PromptTokens, completionTokens = result.CompletionTokens, status = result.Status;
@@ -131,7 +139,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-    if (cacheable && result.Ok && model == selectedModel && status == 200 && !hasToolCalls && !string.IsNullOrWhiteSpace(answer))
+    if (cacheable && result.Ok && !unusableAnswer && model == selectedModel && status == 200 && !hasToolCalls && !string.IsNullOrWhiteSpace(answer))
         responseCache.TryAdd(cacheKey, answer);
 
     var costUsd = hasUsage && !priorUsageUnknown ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
@@ -148,7 +156,28 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
+app.MapGet("/observability", async () =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COUNT(*), "
+        + "COALESCE(ROUND((percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms))::numeric), 0)::integer, "
+        + "COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE status <> '200') / NULLIF(COUNT(*), 0), 1), 0) "
+        + "FROM requests WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day'", db);
+    await using var rows = await cmd.ExecuteReaderAsync();
+    await rows.ReadAsync();
+    var hits = Interlocked.Read(ref cacheHits);
+    var misses = Interlocked.Read(ref cacheMisses);
+    return Results.Json(new
+    {
+        requests = rows.GetInt64(0),
+        p95_ms = rows.GetInt32(1),
+        error_rate_pct = rows.GetDecimal(2),
+        cache_hit_pct = hits + misses == 0 ? 0 : Math.Round(hits * 100.0 / (hits + misses), 1),
+        fallback_events = Interlocked.Read(ref fallbackEvents)
+    });
+});
 app.MapGet("/cost", async () =>
 {
     await using var db = new NpgsqlConnection(dbConn);
@@ -200,7 +229,10 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
     await tx.CommitAsync();
     return Results.Ok(new { name = "support", version, active = true });
 });
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
+app.MapGet("/providers", () => Results.Json(new
+{
+    providers = new[] { new { name = defaultModel, status = Interlocked.Read(ref consecutiveProviderFailures) >= 3 ? "degraded" : "ok" } }
+}));
 app.MapGet("/approvals", () => Results.Json(new
 {
     pending = approvals.Where(x => x.Value.Status == "pending").Select(x => new { id = x.Key, action = x.Value.Action, result = x.Value.Result }).ToArray(),

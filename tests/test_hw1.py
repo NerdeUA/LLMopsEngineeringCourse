@@ -82,7 +82,7 @@ class PromptRegistryTests(unittest.TestCase):
             self.assertEqual(api("/prompts")[1], before)
 
     def test_03_rollback_changes_chat_and_evals(self):
-        for version, expected_exit, expected_count in (("v1", 1, "3/6"), ("v2", 0, "6/6")):
+        for version, expected_exit, expected_count in (("v1", 1, "6/10"), ("v2", 0, "10/10")):
             with self.subTest(version=version):
                 self.activate(version)
                 content = self.logged_chat(version)
@@ -91,12 +91,12 @@ class PromptRegistryTests(unittest.TestCase):
                 else:
                     self.assertNotIn("не знаю", content.lower())
                 result = subprocess.run(
-                    [sys.executable, "evals/run.py", "--dataset", "evals/golden.jsonl", "--threshold", "5"],
+                    [sys.executable, "evals/run.py", "--dataset", "evals/golden.jsonl", "--threshold", "9"],
                     cwd=ROOT, capture_output=True, text=True,
                 )
                 print(result.stdout, end="")
                 self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
-                self.assertIn(f"eval: {expected_count} passed, threshold 5", result.stdout)
+                self.assertIn(f"eval: {expected_count} passed, threshold 9", result.stdout)
 
     def test_04_no_active_prompt_uses_visible_fallback(self):
         try:
