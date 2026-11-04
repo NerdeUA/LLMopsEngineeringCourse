@@ -22,6 +22,7 @@ if (dailyBudgetUsd < 0)
     throw new InvalidOperationException("DAILY_BUDGET_USD must be non-negative");
 var responseCache = new ConcurrentDictionary<(string Model, string Prompt, string Message), string>();
 long cacheHits = 0, cacheMisses = 0;
+long fallbackEvents = 0;
 
 // Additive migration for existing volumes; /chat still reports a registry outage normally.
 try
@@ -77,83 +78,57 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         app.Logger.LogInformation("Response cache miss; hits={Hits}, misses={Misses}", Interlocked.Read(ref cacheHits), miss);
     }
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
-
     var http = httpFactory.CreateClient();
-    var answer = "";
-    string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    var hasUsage = false;
-    var parsedResponse = false;
-    var hasToolCalls = false;
-    try
+    http.Timeout = TimeSpan.FromSeconds(5);
+    var selectedModel = model;
+    var chain = defaultModel == "mock"
+        ? new[] { model, model == "mock-strong" ? "mock-mini" : "mock-strong" }
+        : new[] { model };
+    GatewayResult result = new(false, "", null, false, 0, 0, false, 0);
+    var priorUsageUnknown = false;
+    for (var i = 0; i < chain.Length; i++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-        if (doc.RootElement.TryGetProperty("usage", out var usage)
-            && usage.ValueKind == JsonValueKind.Object
-            && usage.TryGetProperty("prompt_tokens", out var promptUsage)
-            && promptUsage.TryGetInt32(out var measuredPromptTokens)
-            && usage.TryGetProperty("completion_tokens", out var completionUsage)
-            && completionUsage.TryGetInt32(out var measuredCompletionTokens))
+        if (i > 0)
         {
-            promptTokens = measuredPromptTokens;
-            completionTokens = measuredCompletionTokens;
-            hasUsage = true;
+            var count = Interlocked.Increment(ref fallbackEvents);
+            app.Logger.LogWarning("Fallback for request {RequestId}: {PreviousModel} -> {NextModel}; transitions={Count}",
+                requestId, chain[i - 1], chain[i], count);
         }
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
-
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину. поки лише читаємо назву.
-        // TODO(student, W3/W4)
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        result = await CallGateway(http, gateway, chain[i], systemPrompt, body.Message);
+        if (result.Ok)
         {
-            hasToolCalls = true;
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
-            if (tools.GetArrayLength() > 1)
-                app.Logger.LogWarning("Request {RequestId} has multiple tool calls; only the first is handled", requestId);
-            if (toolCall == "lookup_order")
-                answer += " (Навчальний приклад: статус: оплачено, доставку призначено.)";
-            else if (toolCall == "create_ticket")
-                answer = "Тікет не створено: ця дія потребує підтвердження людини.";
-            else
-                answer = "Запитаний інструмент недоступний.";
-            app.Logger.LogInformation("Request {RequestId} requested tool {Tool}; execution={ToolResult}",
-                requestId, toolCall, toolCall == "lookup_order" ? "mock_read" : "not_executed");
+            model = chain[i];
+            break;
         }
-        parsedResponse = true;
-
+        if (!result.HasUsage) priorUsageUnknown = true;
+        // Перемикаємо маршрут лише для тимчасових збоїв, а не помилок запиту.
+        if (result.Status != 0 && result.Status != 429 && result.Status < 500) break;
     }
-    catch
+    if (!result.Ok) model = selectedModel;
+    var answer = result.Ok ? result.Answer : "Сервіс тимчасово недоступний. Спробуйте пізніше.";
+    string? toolCall = null;
+    int promptTokens = result.PromptTokens, completionTokens = result.CompletionTokens, status = result.Status;
+    var hasUsage = result.HasUsage;
+    var hasToolCalls = result.HasToolCalls;
+    if (result.Ok && hasToolCalls)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        toolCall = result.Tool;
+        if (toolCall == "lookup_order")
+            answer += " (Навчальний приклад: статус: оплачено, доставку призначено.)";
+        else if (toolCall == "create_ticket")
+            answer = "Тікет не створено: ця дія потребує підтвердження людини.";
+        else
+            answer = "Запитаний інструмент недоступний.";
+        app.Logger.LogInformation("Request {RequestId} requested tool {Tool}; execution={ToolResult}",
+            requestId, toolCall, toolCall == "lookup_order" ? "mock_read" : "not_executed");
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-    if (cacheable && parsedResponse && status == 200 && !hasToolCalls && !string.IsNullOrWhiteSpace(answer))
+    if (cacheable && result.Ok && model == selectedModel && status == 200 && !hasToolCalls && !string.IsNullOrWhiteSpace(answer))
         responseCache.TryAdd(cacheKey, answer);
 
-    var costUsd = hasUsage ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
-    if (!hasUsage)
+    var costUsd = hasUsage && !priorUsageUnknown ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
+    if (!hasUsage || priorUsageUnknown)
         app.Logger.LogWarning("No usage returned for request {RequestId}; cost_usd remains unknown", requestId);
     else if (costUsd is null)
         app.Logger.LogWarning("No price configured for model {Model}; cost_usd remains unknown", model);
@@ -223,6 +198,42 @@ app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals
 
 app.Run("http://0.0.0.0:8080");
 
+static async Task<GatewayResult> CallGateway(HttpClient http, string gateway, string model, string systemPrompt, string userMessage)
+{
+    var payload = JsonSerializer.Serialize(new
+    {
+        model,
+        messages = new object[] { new { role = "system", content = systemPrompt }, new { role = "user", content = userMessage } }
+    });
+    try
+    {
+        using var response = await http.PostAsync($"{gateway}/v1/chat/completions",
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+        var status = (int)response.StatusCode;
+        if (!response.IsSuccessStatusCode)
+            return new(false, "", null, false, 0, 0, false, status);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var pt = 0;
+        var ct = 0;
+        var hasUsage = doc.RootElement.TryGetProperty("usage", out var usage)
+            && usage.ValueKind == JsonValueKind.Object
+            && usage.TryGetProperty("prompt_tokens", out var promptUsage)
+            && promptUsage.TryGetInt32(out pt)
+            && usage.TryGetProperty("completion_tokens", out var completionUsage)
+            && completionUsage.TryGetInt32(out ct);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        var answer = message.GetProperty("content").GetString() ?? "";
+        var hasTools = message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0;
+        var tool = hasTools ? tools[0].GetProperty("function").GetProperty("name").GetString() : null;
+        return new(true, answer, tool, hasTools, pt, ct, hasUsage, status);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or InvalidOperationException or KeyNotFoundException)
+    {
+        return new(false, "", null, false, 0, 0, false, 0);
+    }
+}
+
 static async Task<(string Body, string Version)> ReadActivePrompt(string conn, ILogger logger)
 {
     await using var db = new NpgsqlConnection(conn);
@@ -262,3 +273,5 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
 }
 
 record ChatIn(string Message);
+record GatewayResult(bool Ok, string Answer, string? Tool, bool HasToolCalls, int PromptTokens,
+    int CompletionTokens, bool HasUsage, int Status);
