@@ -27,8 +27,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_prompts_one_active
     ON prompts (name) WHERE active;
 
 INSERT INTO prompts (name, version, body, active) VALUES
-    ('support', 'v1', 'You are an assistant.', true),
-    ('support', 'v2', 'You are a support assistant. Be concise and helpful.', false)
+    ('support', 'v1', 'You are an assistant.', false),
+    ('support', 'v2', 'You are a support assistant. Be concise and helpful.', true)
 ON CONFLICT (name, version) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);
