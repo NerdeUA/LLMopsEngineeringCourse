@@ -36,11 +36,13 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_successful_fallback_records_the_actual_model(self):
         calls = []
+        inputs = []
 
         class Gateway(BaseHTTPRequestHandler):
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 calls.append(data['model'])
+                inputs.append(data['messages'][-1]['content'])
                 if data['model'] == 'mock-mini':
                     self.send_response(503)
                     self.end_headers()
@@ -78,12 +80,13 @@ class ReliabilityTests(unittest.TestCase):
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(.2)
-        request = urllib.request.Request(base + '/chat', data=json.dumps({'message': 'Тест резерву'}).encode(),
+        request = urllib.request.Request(base + '/chat', data=json.dumps({'message': 'Тест резерву user.one+tag@example.org'}).encode(),
                                          headers={'Content-Type': 'application/json'})
         with OPENER.open(request, timeout=15) as response:
             body = json.load(response)
         self.assertEqual(body['content'], 'Резервна відповідь')
         self.assertEqual(calls, ['mock-mini', 'mock-strong'])
+        self.assertEqual(inputs, ['Тест резерву [email]', 'Тест резерву [email]'])
         row = json.loads(sql('SELECT row_to_json(r) FROM requests r WHERE request_id = '
                              f"'{body['request_id']}'::uuid"))
         self.assertEqual(row['model'], 'mock-strong')

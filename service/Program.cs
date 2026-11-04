@@ -6,6 +6,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -23,6 +24,7 @@ if (dailyBudgetUsd < 0)
 var responseCache = new ConcurrentDictionary<(string Model, string Prompt, string Message), string>();
 long cacheHits = 0, cacheMisses = 0;
 long fallbackEvents = 0;
+var approvals = new ConcurrentDictionary<string, Approval>();
 
 // Additive migration for existing volumes; /chat still reports a registry outage normally.
 try
@@ -42,11 +44,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // Маскування перед routing, ключем кешу та будь-яким викликом gateway.
+    var userMessage = MaskPii(body.Message);
 
     // Звичайні питання -> mock-mini; ескалації UK/EN -> mock-strong.
-    var model = ModelPolicy.SelectModel(body.Message, defaultModel);
+    var model = ModelPolicy.SelectModel(userMessage, defaultModel);
 
     // Текст і версія читаються разом: лог описує саме використаний промпт.
     string systemPrompt, promptVersion;
@@ -62,8 +64,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // Лише перевірені публічні FAQ. Персональні або невідомі запити оминають кеш.
-    var cacheable = PublicFaqCache.IsEligible(body.Message);
-    var cacheKey = (model, systemPrompt, body.Message);
+    var cacheable = PublicFaqCache.IsEligible(userMessage);
+    var cacheKey = (model, systemPrompt, userMessage);
     if (cacheable && responseCache.TryGetValue(cacheKey, out var cachedAnswer))
     {
         var hit = Interlocked.Increment(ref cacheHits);
@@ -94,7 +96,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             app.Logger.LogWarning("Fallback for request {RequestId}: {PreviousModel} -> {NextModel}; transitions={Count}",
                 requestId, chain[i - 1], chain[i], count);
         }
-        result = await CallGateway(http, gateway, chain[i], systemPrompt, body.Message);
+        result = await CallGateway(http, gateway, chain[i], systemPrompt, userMessage);
         if (result.Ok)
         {
             model = chain[i];
@@ -107,6 +109,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     if (!result.Ok) model = selectedModel;
     var answer = result.Ok ? result.Answer : "Сервіс тимчасово недоступний. Спробуйте пізніше.";
     string? toolCall = null;
+    string? approvalId = null;
     int promptTokens = result.PromptTokens, completionTokens = result.CompletionTokens, status = result.Status;
     var hasUsage = result.HasUsage;
     var hasToolCalls = result.HasToolCalls;
@@ -116,7 +119,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         if (toolCall == "lookup_order")
             answer += " (Навчальний приклад: статус: оплачено, доставку призначено.)";
         else if (toolCall == "create_ticket")
-            answer = "Тікет не створено: ця дія потребує підтвердження людини.";
+        {
+            approvalId = Guid.NewGuid().ToString("N");
+            approvals[approvalId] = new Approval("create_ticket", "pending", null, requestId);
+            answer = $"Тікет не створено: дія очікує підтвердження оператора (id={approvalId}).";
+        }
         else
             answer = "Запитаний інструмент недоступний.";
         app.Logger.LogInformation("Request {RequestId} requested tool {Tool}; execution={ToolResult}",
@@ -136,7 +143,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status, toolCall);
 
-    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
+    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, approval_id = approvalId, latency_ms = latencyMs });
 });
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
@@ -194,9 +201,27 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
     return Results.Ok(new { name = "support", version, active = true });
 });
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+app.MapGet("/approvals", () => Results.Json(new
+{
+    pending = approvals.Where(x => x.Value.Status == "pending").Select(x => new { id = x.Key, action = x.Value.Action, result = x.Value.Result }).ToArray(),
+    completed = approvals.Where(x => x.Value.Status == "completed").Select(x => new { id = x.Key, action = x.Value.Action, result = x.Value.Result }).ToArray()
+}));
+app.MapPost("/approvals/{id}/approve", (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var pending) || pending.Status != "pending")
+        return Results.NotFound(new { error = "already done or unknown" });
+    var claimed = pending with { Status = "processing" };
+    if (!approvals.TryUpdate(id, claimed, pending))
+        return Results.NotFound(new { error = "already done or unknown" });
+    var ticket = "тікет #T-" + Guid.NewGuid().ToString("N")[..8];
+    approvals[id] = claimed with { Status = "completed", Result = ticket };
+    app.Logger.LogInformation("Approval {ApprovalId} completed for request {RequestId}", id, pending.RequestId);
+    return Results.Ok(new { id, result = ticket });
+});
 
 app.Run("http://0.0.0.0:8080");
+
+static string MaskPii(string? message) => Regex.Replace(message ?? "", @"[\w.+-]+@[\w.-]+", "[email]", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
 static async Task<GatewayResult> CallGateway(HttpClient http, string gateway, string model, string systemPrompt, string userMessage)
 {
@@ -275,3 +300,4 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
 record ChatIn(string Message);
 record GatewayResult(bool Ok, string Answer, string? Tool, bool HasToolCalls, int PromptTokens,
     int CompletionTokens, bool HasUsage, int Status);
+record Approval(string Action, string Status, string? Result, Guid RequestId);
