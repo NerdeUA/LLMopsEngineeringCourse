@@ -1,7 +1,9 @@
-import { Component } from '@angular/core';
+import { Component, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
+import { Subscription } from 'rxjs';
+import { ApprovalEventsService } from './approval-events.service';
 
 interface Msg {
   role: 'user' | 'bot';
@@ -70,12 +72,24 @@ interface Msg {
     `,
   ],
 })
-export class ChatComponent {
+export class ChatComponent implements OnDestroy {
   messages: Msg[] = [{ role: 'bot', text: 'Вітаю! Чим можу допомогти?' }];
   draft = '';
   busy = false;
 
-  constructor(private http: HttpClient) {}
+  private readonly pendingApprovals = new Set<string>();
+  private readonly approvalSubscription: Subscription;
+
+  constructor(private http: HttpClient, approvalEvents: ApprovalEventsService) {
+    this.approvalSubscription = approvalEvents.completed$.subscribe(({ id, result }) => {
+      if (!this.pendingApprovals.delete(id)) return;
+      this.messages.push({ role: 'bot', text: `Заявку ${id} підтверджено оператором — ${result} створено.` });
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.approvalSubscription.unsubscribe();
+  }
 
   send(e: Event): void {
     e.preventDefault();
@@ -84,8 +98,9 @@ export class ChatComponent {
     this.messages.push({ role: 'user', text });
     this.draft = '';
     this.busy = true;
-    this.http.post<{ content: string; latency_ms: number; tool: string | null }>('/api/chat', { message: text }).subscribe({
+    this.http.post<{ content: string; latency_ms: number; tool: string | null; approval_id?: string | null }>('/api/chat', { message: text }).subscribe({
       next: (r) => {
+        if (r.approval_id) this.pendingApprovals.add(r.approval_id);
         this.messages.push({ role: 'bot', text: r.content, latency: r.latency_ms, tool: r.tool });
         this.busy = false;
       },
