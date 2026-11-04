@@ -1,4 +1,4 @@
-import { Component, OnDestroy } from '@angular/core';
+import { Component, ElementRef, OnDestroy, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
@@ -25,7 +25,7 @@ interface Msg {
           <div class="sub">відповідає за кілька секунд</div>
         </div>
       </div>
-      <div class="body">
+      <div class="body" #messageBody>
         <ng-container *ngFor="let m of messages">
           <div class="row" [class.user]="m.role === 'user'">
             <div class="msg" [class.user]="m.role === 'user'">{{ m.text }}</div>
@@ -73,6 +73,7 @@ interface Msg {
   ],
 })
 export class ChatComponent implements OnDestroy {
+  @ViewChild('messageBody') private messageBody?: ElementRef<HTMLElement>;
   messages: Msg[] = [{ role: 'bot', text: 'Вітаю! Чим можу допомогти?' }];
   draft = '';
   busy = false;
@@ -84,6 +85,7 @@ export class ChatComponent implements OnDestroy {
     this.approvalSubscription = approvalEvents.completed$.subscribe(({ id, result }) => {
       if (!this.pendingApprovals.delete(id)) return;
       this.messages.push({ role: 'bot', text: `Заявку ${id} підтверджено оператором — ${result} створено.` });
+      this.scrollToLatest();
     });
   }
 
@@ -91,21 +93,31 @@ export class ChatComponent implements OnDestroy {
     this.approvalSubscription.unsubscribe();
   }
 
+  private scrollToLatest(): void {
+    setTimeout(() => {
+      const element = this.messageBody?.nativeElement;
+      if (element) element.scrollTop = element.scrollHeight;
+    });
+  }
+
   send(e: Event): void {
     e.preventDefault();
     const text = this.draft.trim();
     if (!text || this.busy) return;
     this.messages.push({ role: 'user', text });
+    this.scrollToLatest();
     this.draft = '';
     this.busy = true;
     this.http.post<{ content: string; latency_ms: number; tool: string | null; approval_id?: string | null }>('/api/chat', { message: text }).subscribe({
       next: (r) => {
         if (r.approval_id) this.pendingApprovals.add(r.approval_id);
         this.messages.push({ role: 'bot', text: r.content, latency: r.latency_ms, tool: r.tool });
+        this.scrollToLatest();
         this.busy = false;
       },
       error: () => {
         this.messages.push({ role: 'bot', text: 'Помилка зʼєднання.' });
+        this.scrollToLatest();
         this.busy = false;
       },
     });

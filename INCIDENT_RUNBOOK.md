@@ -14,7 +14,7 @@ gateway. В іншому терміналі виконайте команди н
 ```sh
 BASE=${BASE:-http://localhost:8080}
 curl -fsS "$BASE/health"
-curl -fsS -X POST "$BASE/chat" -H 'Content-Type: application/json' -d '{"message":"How do I reset my password?"}'
+curl -fsS -X POST "$BASE/chat" -H 'Content-Type: application/json' -d '{"message":"How can I login?"}'
 curl -fsS "$BASE/observability"
 curl -fsS "$BASE/providers"
 ```
@@ -50,7 +50,7 @@ docker compose exec -T postgres psql -U llmops -d llmops -c "SELECT created_at, 
 
 ```sh
 for i in $(seq 1 30); do
-  curl -fsS -X POST "$BASE/chat" -H 'Content-Type: application/json' -d "{\"message\":\"Recovery check $i - how do I log in?\"}"
+  curl -fsS -X POST "$BASE/chat" -H 'Content-Type: application/json' -d "{\"message\":\"Recovery check $i - login help\"}"
 done
 curl -fsS "$BASE/observability"
 curl -fsS "$BASE/providers"
