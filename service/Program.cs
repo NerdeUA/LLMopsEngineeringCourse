@@ -1,6 +1,7 @@
 // Сервіс — це наш control plane. LiteLLM тільки ходить у модель, а рішення
 // (яку модель брати, коли ретраїти, скільки коштує) робимо тут.
-// MODEL=mock — дефолт, грошей не треба. MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
+// MODEL=mock — роутинг між mock-mini/mock-strong, грошей не треба.
+// Явний MODEL обирає одну модель; її реальний тариф треба додати в ModelPolicy.
 
 using System.Text;
 using System.Text.Json;
@@ -15,6 +16,9 @@ var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL") ?? "http://gatew
 var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
+var dailyBudgetUsd = builder.Configuration.GetValue<decimal>("DAILY_BUDGET_USD", 10m);
+if (dailyBudgetUsd < 0)
+    throw new InvalidOperationException("DAILY_BUDGET_USD must be non-negative");
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -24,11 +28,21 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // Звичайні питання -> mock-mini; ескалації UK/EN -> mock-strong.
+    var model = ModelPolicy.SelectModel(body.Message, defaultModel);
 
     // Текст і версія читаються разом: лог описує саме використаний промпт.
-    var (systemPrompt, promptVersion) = await ReadActivePrompt(dbConn, app.Logger);
+    string systemPrompt, promptVersion;
+    try
+    {
+        (systemPrompt, promptVersion) = await ReadActivePrompt(dbConn, app.Logger);
+    }
+    catch (NpgsqlException)
+    {
+        // Інфраструктурний збій не є порожнім реєстром: БД не зможе зберегти і лог.
+        app.Logger.LogError("Prompt registry unavailable for request {RequestId}", requestId);
+        return Results.Problem(statusCode: 503, title: "Prompt registry unavailable");
+    }
 
     // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
     // TODO(student, W3)
@@ -83,8 +97,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+    var costUsd = ModelPolicy.CalculateCost(model, promptTokens, completionTokens);
+    if (costUsd is null)
+        app.Logger.LogWarning("No price configured for model {Model}; cost_usd remains unknown", model);
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
@@ -95,7 +110,17 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
+app.MapGet("/cost", async () =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    // Межі дня визначає Postgres, як і CURRENT_DATE у SQL перевірки домашки.
+    await using var cmd = new NpgsqlCommand(
+        "SELECT round(COALESCE(SUM(cost_usd), 0), 4) FROM requests "
+        + "WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day'", db);
+    var todayUsd = (decimal)(await cmd.ExecuteScalarAsync())!;
+    return Results.Json(new { today_usd = todayUsd, budget_usd = dailyBudgetUsd });
+});
 app.MapGet("/prompts", async () =>
 {
     await using var db = new NpgsqlConnection(dbConn);
@@ -143,21 +168,14 @@ app.Run("http://0.0.0.0:8080");
 
 static async Task<(string Body, string Version)> ReadActivePrompt(string conn, ILogger logger)
 {
-    try
-    {
-        await using var db = new NpgsqlConnection(conn);
-        await db.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            "SELECT body, version FROM prompts WHERE name = 'support' AND active", db);
-        await using var rows = await cmd.ExecuteReaderAsync();
-        if (await rows.ReadAsync())
-            return (rows.GetString(0), rows.GetString(1));
-        logger.LogWarning("No active support prompt; using fallback prompt (version none)");
-    }
-    catch (NpgsqlException)
-    {
-        logger.LogWarning("Prompt registry unavailable; using fallback prompt (version none)");
-    }
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT body, version FROM prompts WHERE name = 'support' AND active", db);
+    await using var rows = await cmd.ExecuteReaderAsync();
+    if (await rows.ReadAsync())
+        return (rows.GetString(0), rows.GetString(1));
+    logger.LogWarning("No active support prompt; using fallback prompt (version none)");
     return ("You are an assistant.", "none");
 }
 
