@@ -19,6 +19,7 @@ static class ModelPolicy
 
         // Запланований fallback chain (виконання — HW4):
         // mock-strong -> mock-mini -> заглушка; mock-mini -> mock-strong -> заглушка.
+        // За 80% денного бюджету: записати попередження в лог; автоматичну реакцію не реалізовано.
         return EscalationMarkers.Any(marker =>
             (message ?? "").Contains(marker, StringComparison.OrdinalIgnoreCase))
             ? "mock-strong" : "mock-mini";

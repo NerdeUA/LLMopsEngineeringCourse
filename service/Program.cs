@@ -16,7 +16,7 @@ var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL") ?? "http://gatew
 var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
-var dailyBudgetUsd = builder.Configuration.GetValue<decimal>("DAILY_BUDGET_USD", 10m);
+var dailyBudgetUsd = builder.Configuration.GetValue<decimal>("DAILY_BUDGET_USD", 5m);
 if (dailyBudgetUsd < 0)
     throw new InvalidOperationException("DAILY_BUDGET_USD must be non-negative");
 
@@ -63,6 +63,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var answer = "";
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
+    var hasUsage = false;
     try
     {
         var response = await http.PostAsync(
@@ -72,6 +73,17 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         var rawJson = await response.Content.ReadAsStringAsync();
 
         using var doc = JsonDocument.Parse(rawJson);
+        if (doc.RootElement.TryGetProperty("usage", out var usage)
+            && usage.ValueKind == JsonValueKind.Object
+            && usage.TryGetProperty("prompt_tokens", out var promptUsage)
+            && promptUsage.TryGetInt32(out var measuredPromptTokens)
+            && usage.TryGetProperty("completion_tokens", out var completionUsage)
+            && completionUsage.TryGetInt32(out var measuredCompletionTokens))
+        {
+            promptTokens = measuredPromptTokens;
+            completionTokens = measuredCompletionTokens;
+            hasUsage = true;
+        }
         var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
         answer = message.GetProperty("content").GetString() ?? "";
 
@@ -84,9 +96,6 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
         }
 
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
     }
     catch
     {
@@ -97,8 +106,10 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    var costUsd = ModelPolicy.CalculateCost(model, promptTokens, completionTokens);
-    if (costUsd is null)
+    var costUsd = hasUsage ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
+    if (!hasUsage)
+        app.Logger.LogWarning("No usage returned for request {RequestId}; cost_usd remains unknown", requestId);
+    else if (costUsd is null)
         app.Logger.LogWarning("No price configured for model {Model}; cost_usd remains unknown", model);
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)

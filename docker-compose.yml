@@ -11,7 +11,7 @@ services:
       - GATEWAY_URL=http://gateway:4000
       - DB_CONN=Host=postgres;Database=llmops;Username=llmops;Password=llmops
       - MODEL=${MODEL:-mock}   # mock = routing mini/strong; інше значення = явний вибір моделі
-      - DAILY_BUDGET_USD=${DAILY_BUDGET_USD:-10}
+      - DAILY_BUDGET_USD=${DAILY_BUDGET_USD:-5}
     depends_on: [gateway, postgres]
 
   gateway:

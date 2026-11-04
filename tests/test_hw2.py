@@ -54,13 +54,13 @@ class RoutingCostTests(unittest.TestCase):
         unit_costs = [r["cost_usd"] / (r["prompt_tokens"] + r["completion_tokens"]) for r in rows]
         self.assertGreater(unit_costs[1] / unit_costs[0], 10)
 
-    def test_04_gateway_failure_without_usage_has_zero_cost(self):
+    def test_04_gateway_failure_without_usage_has_unknown_cost(self):
         row = self.logged_chat("__fail_503")
         self.assertEqual(row["status"], "503")
         self.assertEqual(row["model"], "mock-mini")
         self.assertEqual(row["prompt_tokens"], 0)
         self.assertEqual(row["completion_tokens"], 0)
-        self.assertEqual(row["cost_usd"], Decimal("0"))
+        self.assertIsNone(row["cost_usd"])
 
     def test_05_cost_endpoint_matches_database_today(self):
         self.logged_chat("Привіт")
@@ -71,7 +71,7 @@ class RoutingCostTests(unittest.TestCase):
         self.assertIsInstance(cost["today_usd"], (int, float))
         self.assertIsInstance(cost["budget_usd"], (int, float))
         self.assertGreater(cost["today_usd"], 0)
-        self.assertEqual(cost["budget_usd"], 10)
+        self.assertEqual(cost["budget_usd"], 5)
         expected = Decimal(sql(
             "SELECT round(COALESCE(SUM(cost_usd), 0), 4) FROM requests "
             "WHERE created_at::date = CURRENT_DATE"
