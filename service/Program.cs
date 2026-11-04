@@ -5,6 +5,7 @@
 
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -19,6 +20,8 @@ var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 var dailyBudgetUsd = builder.Configuration.GetValue<decimal>("DAILY_BUDGET_USD", 5m);
 if (dailyBudgetUsd < 0)
     throw new InvalidOperationException("DAILY_BUDGET_USD must be non-negative");
+var responseCache = new ConcurrentDictionary<(string Model, string Prompt, string Message), string>();
+long cacheHits = 0, cacheMisses = 0;
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -44,8 +47,22 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return Results.Problem(statusCode: 503, title: "Prompt registry unavailable");
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
-    // TODO(student, W3)
+    // Лише перевірені публічні FAQ. Персональні або невідомі запити оминають кеш.
+    var cacheable = PublicFaqCache.IsEligible(body.Message);
+    var cacheKey = (model, systemPrompt, body.Message);
+    if (cacheable && responseCache.TryGetValue(cacheKey, out var cachedAnswer))
+    {
+        var hit = Interlocked.Increment(ref cacheHits);
+        app.Logger.LogInformation("Response cache hit; hits={Hits}, misses={Misses}", hit, Interlocked.Read(ref cacheMisses));
+        var cachedLatency = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        await LogRequest(dbConn, requestId, model, promptVersion, cachedLatency, 0, 0, 0m, 200);
+        return Results.Json(new { request_id = requestId, content = cachedAnswer, tool = (string?)null, latency_ms = cachedLatency });
+    }
+    if (cacheable)
+    {
+        var miss = Interlocked.Increment(ref cacheMisses);
+        app.Logger.LogInformation("Response cache miss; hits={Hits}, misses={Misses}", Interlocked.Read(ref cacheHits), miss);
+    }
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -64,6 +81,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
     var hasUsage = false;
+    var parsedResponse = false;
     try
     {
         var response = await http.PostAsync(
@@ -95,6 +113,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         {
             toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
         }
+        parsedResponse = true;
 
     }
     catch
@@ -105,6 +124,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+    if (cacheable && parsedResponse && status == 200 && toolCall is null && !string.IsNullOrWhiteSpace(answer))
+        responseCache.TryAdd(cacheKey, answer);
 
     var costUsd = hasUsage ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
     if (!hasUsage)

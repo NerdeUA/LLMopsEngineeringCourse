@@ -36,7 +36,7 @@ class RoutingCostTests(unittest.TestCase):
     def test_03_cost_uses_model_input_and_output_rates(self):
         rows = []
         for message, input_rate, output_rate in (
-            ("How do I reset my password?", Decimal("0.001"), Decimal("0.002")),
+            ("How do I reset my password? (cost check)", Decimal("0.001"), Decimal("0.002")),
             ("URGENT: How do I reset my password?", Decimal("0.016"), Decimal("0.032")),
         ):
             row = self.logged_chat(message)
