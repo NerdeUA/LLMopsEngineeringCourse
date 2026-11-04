@@ -5,6 +5,7 @@
 
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -19,6 +20,21 @@ var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 var dailyBudgetUsd = builder.Configuration.GetValue<decimal>("DAILY_BUDGET_USD", 5m);
 if (dailyBudgetUsd < 0)
     throw new InvalidOperationException("DAILY_BUDGET_USD must be non-negative");
+var responseCache = new ConcurrentDictionary<(string Model, string Prompt, string Message), string>();
+long cacheHits = 0, cacheMisses = 0;
+
+// Additive migration for existing volumes; /chat still reports a registry outage normally.
+try
+{
+    await using var migrationDb = new NpgsqlConnection(dbConn);
+    await migrationDb.OpenAsync();
+    await using var migration = new NpgsqlCommand("ALTER TABLE requests ADD COLUMN IF NOT EXISTS tool TEXT", migrationDb);
+    await migration.ExecuteNonQueryAsync();
+}
+catch (NpgsqlException ex)
+{
+    app.Logger.LogWarning(ex, "Could not apply requests.tool migration; restart after database recovery");
+}
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -44,8 +60,22 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return Results.Problem(statusCode: 503, title: "Prompt registry unavailable");
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
-    // TODO(student, W3)
+    // Лише перевірені публічні FAQ. Персональні або невідомі запити оминають кеш.
+    var cacheable = PublicFaqCache.IsEligible(body.Message);
+    var cacheKey = (model, systemPrompt, body.Message);
+    if (cacheable && responseCache.TryGetValue(cacheKey, out var cachedAnswer))
+    {
+        var hit = Interlocked.Increment(ref cacheHits);
+        app.Logger.LogInformation("Response cache hit; hits={Hits}, misses={Misses}", hit, Interlocked.Read(ref cacheMisses));
+        var cachedLatency = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        await LogRequest(dbConn, requestId, model, promptVersion, cachedLatency, 0, 0, 0m, 200, null);
+        return Results.Json(new { request_id = requestId, content = cachedAnswer, tool = (string?)null, latency_ms = cachedLatency });
+    }
+    if (cacheable)
+    {
+        var miss = Interlocked.Increment(ref cacheMisses);
+        app.Logger.LogInformation("Response cache miss; hits={Hits}, misses={Misses}", Interlocked.Read(ref cacheHits), miss);
+    }
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -64,6 +94,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
     var hasUsage = false;
+    var parsedResponse = false;
+    var hasToolCalls = false;
     try
     {
         var response = await http.PostAsync(
@@ -93,8 +125,20 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         if (message.TryGetProperty("tool_calls", out var tools)
             && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
         {
+            hasToolCalls = true;
             toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            if (tools.GetArrayLength() > 1)
+                app.Logger.LogWarning("Request {RequestId} has multiple tool calls; only the first is handled", requestId);
+            if (toolCall == "lookup_order")
+                answer += " (Навчальний приклад: статус: оплачено, доставку призначено.)";
+            else if (toolCall == "create_ticket")
+                answer = "Тікет не створено: ця дія потребує підтвердження людини.";
+            else
+                answer = "Запитаний інструмент недоступний.";
+            app.Logger.LogInformation("Request {RequestId} requested tool {Tool}; execution={ToolResult}",
+                requestId, toolCall, toolCall == "lookup_order" ? "mock_read" : "not_executed");
         }
+        parsedResponse = true;
 
     }
     catch
@@ -105,6 +149,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+    if (cacheable && parsedResponse && status == 200 && !hasToolCalls && !string.IsNullOrWhiteSpace(answer))
+        responseCache.TryAdd(cacheKey, answer);
 
     var costUsd = hasUsage ? ModelPolicy.CalculateCost(model, promptTokens, completionTokens) : null;
     if (!hasUsage)
@@ -113,7 +159,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         app.Logger.LogWarning("No price configured for model {Model}; cost_usd remains unknown", model);
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status, toolCall);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -192,15 +238,15 @@ static async Task<(string Body, string Version)> ReadActivePrompt(string conn, I
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
+    int promptTokens, int completionTokens, decimal? cost, int status, string? tool)
 {
     try
     {
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @version, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status, tool) "
+            + "VALUES (@id, @model, @version, @lat, @pt, @ct, @cost, @status, @tool)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
         cmd.Parameters.AddWithValue("version", promptVersion);
@@ -209,6 +255,7 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
         cmd.Parameters.AddWithValue("ct", completionTokens);
         cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
         cmd.Parameters.AddWithValue("status", status.ToString());
+        cmd.Parameters.AddWithValue("tool", NpgsqlTypes.NpgsqlDbType.Text, (object?)tool ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* не валимо запит через лог */ }

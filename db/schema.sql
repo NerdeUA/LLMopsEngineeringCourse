@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS requests (
     prompt_tokens   INTEGER,
     completion_tokens INTEGER,
     cost_usd        NUMERIC(10, 6),
-    status          TEXT
+    status          TEXT,
+    tool            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompts (
