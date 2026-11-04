@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
+import { ApprovalEventsService, ApprovalResult } from './approval-events.service';
 
 @Component({
   selector: 'app-console',
@@ -112,7 +113,7 @@ export class ConsoleComponent implements OnInit, OnDestroy {
   approvals: any[] | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient, private approvalEvents: ApprovalEventsService) {}
 
   ngOnInit(): void {
     this.refresh();
@@ -133,8 +134,11 @@ export class ConsoleComponent implements OnInit, OnDestroy {
   }
 
   approve(id: string): void {
-    this.http.post('/api/approvals/' + id + '/approve', {}).subscribe({
-      next: () => this.refresh(),
+    this.http.post<ApprovalResult>('/api/approvals/' + id + '/approve', {}).subscribe({
+      next: (result) => {
+        this.approvalEvents.completed(result);
+        this.refresh();
+      },
       error: () => this.refresh(),
     });
   }
